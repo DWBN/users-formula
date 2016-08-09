@@ -38,7 +38,8 @@ include:
 {%- if user == None -%}
 {%- set user = {} -%}
 {%- endif -%}
-{%- set home = user.get('home', "/home/%s" % name) -%}
+{%- set current = salt.user.info(name) -%}
+{%- set home = user.get('home', current.get('home', "/home/%s" % name)) -%}
 
 {%- if 'prime_group' in user and 'name' in user['prime_group'] %}
 {%- set user_group = user.prime_group.name -%}
@@ -48,9 +49,11 @@ include:
 
 {% for group in user.get('groups', []) %}
 users_{{ name }}_{{ group }}_group:
-  group:
+  group.present:
     - name: {{ group }}
-    - present
+    {% if group == 'sudo' %}
+    - system: True
+    {% endif %}
 {% endfor %}
 
 users_{{ name }}_user:
@@ -71,15 +74,21 @@ users_{{ name }}_user:
     {%- elif 'uid' in user %}
     - gid: {{ user['uid'] }}
     {%- endif %}
+    {% if 'system' in user and user['system'] %}
+    - system: True
+    {% endif %}
   user.present:
     - name: {{ name }}
     - home: {{ home }}
-    - shell: {{ user.get('shell', users.get('shell', '/bin/bash')) }}
+    - shell: {{ user.get('shell', current.get('shell', users.get('shell', '/bin/bash'))) }}
     {% if 'uid' in user -%}
     - uid: {{ user['uid'] }}
     {% endif -%}
     {% if 'password' in user -%}
     - password: '{{ user['password'] }}'
+    {% endif -%}
+    {% if user.get('empty_password') -%}
+    - empty_password: {{ user.get('empty_password') }}
     {% endif -%}
     {% if 'enforce_password' in user -%}
     - enforce_password: {{ user['enforce_password'] }}
@@ -95,11 +104,30 @@ users_{{ name }}_user:
     {% if 'fullname' in user %}
     - fullname: {{ user['fullname'] }}
     {% endif -%}
+    {% if 'roomnumber' in user %}
+    - roomnumber: {{ user['roomnumber'] }}
+    {% endif %}
+    {% if 'workphone' in user %}
+    - workphone: {{ user['workphone'] }}
+    {% endif %}
+    {% if 'homephone' in user %}
+    - homephone: {{ user['workphone'] }}
+    {% endif %}
     {% if not user.get('createhome', True) %}
     - createhome: False
     {% endif %}
     {% if 'expire' in user -%}
+        {% if grains['kernel'].endswith('BSD') and
+            user['expire'] < 157766400 %}
+        {# 157762800s since epoch equals 01 Jan 1975 00:00:00 UTC #}
+    - expire: {{ user['expire'] * 86400 }}
+        {% elif grains['kernel'] == 'Linux' and
+            user['expire'] > 84006 %}
+        {# 2932896 days since epoch equals 9999-12-31 #}
+    - expire: {{ (user['expire'] / 86400) | int}}
+        {% else %}
     - expire: {{ user['expire'] }}
+        {% endif %}
     {% endif -%}
     - remove_groups: {{ user.get('remove_groups', 'False') }}
     - groups:
@@ -107,6 +135,12 @@ users_{{ name }}_user:
       {% for group in user.get('groups', []) -%}
       - {{ group }}
       {% endfor %}
+    {% if 'optional_groups' in user %}
+    - optional_groups:
+      {% for optional_group in user['optional_groups'] -%}
+      - {{optional_group}}
+      {% endfor %}
+    {% endif %}
     - require:
       - group: {{ user_group }}
       {% for group in user.get('groups', []) -%}
@@ -117,11 +151,12 @@ users_{{ name }}_user:
   {% if 'ssh_keys' in user or
       'ssh_auth' in user or
       'ssh_auth_file' in user or
+      'ssh_auth_pillar' in user or
       'ssh_auth.absent' in user or
       'ssh_config' in user %}
 user_keydir_{{ name }}:
   file.directory:
-    - name: {{ user.get('home', '/home/{0}'.format(name)) }}/.ssh
+    - name: {{ home }}/.ssh
     - user: {{ name }}
     - group: {{ user_group }}
     - makedirs: True
@@ -138,8 +173,7 @@ user_keydir_{{ name }}:
   {% set key_type = 'id_' + user.get('ssh_key_type', 'rsa') %}
 users_user_{{ name }}_private_key:
   file.managed:
-    - name: {{ user.get('home',
-                  '/home/{0}'.format(name)) }}/.ssh/{{ key_type }}
+    - name: {{ home }}/.ssh/{{ key_type }}
     - user: {{ name }}
     - group: {{ user_group }}
     - mode: 600
@@ -152,8 +186,7 @@ users_user_{{ name }}_private_key:
       {% endfor %}
 users_user_{{ name }}_public_key:
   file.managed:
-    - name: {{ user.get('home',
-                  '/home/{0}'.format(name)) }}/.ssh/{{ key_type }}.pub
+    - name: {{ home }}/.ssh/{{ key_type }}.pub
     - user: {{ name }}
     - group: {{ user_group }}
     - mode: 644
@@ -171,7 +204,7 @@ users_authorized_keys_{{ name }}:
   file.managed:
     - name: {{ home }}/.ssh/authorized_keys
     - user: {{ name }}
-    - group: {{ name }}
+    - group: {{ user_group }}
     - mode: 600
 {% if 'ssh_auth_file' in user %}
     - contents: |
@@ -179,9 +212,8 @@ users_authorized_keys_{{ name }}:
         {{ auth }}
         {% endfor -%}
 {% else %}
-    - contents: |
-        {%- for key_name, pillar_name in user['ssh_auth_pillar'].iteritems() %}
-        {{ salt['pillar.get'](pillar_name + ':' + key_name + ':pubkey', '') }}
+        {%- for key_name, pillar_name in user['ssh_auth_pillar'].items() %}
+    - contents_pillar: {{ pillar_name }}:{{ key_name }}:pubkey
         {%- endfor %}
 {% endif %}
 {% endif %}
@@ -193,7 +225,7 @@ users_ssh_auth_{{ name }}_{{ loop.index0 }}:
     - user: {{ name }}
     - name: {{ auth }}
     - require:
-        - file: users_{{ name }}_user
+        - file: user_keydir_{{ name }}
         - user: users_{{ name }}_user
 {% endfor %}
 {% endif %}
@@ -202,8 +234,7 @@ users_ssh_auth_{{ name }}_{{ loop.index0 }}:
 {% for key_name, pillar_name in user['ssh_keys_pillar'].items() %}
 user_ssh_keys_files_{{ name }}_{{ key_name }}_private_key:
   file.managed:
-    - name: {{ user.get('home',
-                  '/home/{0}'.format(name)) }}/.ssh/{{ key_name }}
+    - name: {{ home }}/.ssh/{{ key_name }}
     - user: {{ name }}
     - group: {{ user_group }}
     - mode: 600
@@ -216,8 +247,7 @@ user_ssh_keys_files_{{ name }}_{{ key_name }}_private_key:
       {% endfor %}
 user_ssh_keys_files_{{ name }}_{{ key_name }}_public_key:
   file.managed:
-    - name: {{ user.get('home',
-                  '/home/{0}'.format(name)) }}/.ssh/{{ key_name }}.pub
+    - name: {{ home }}/.ssh/{{ key_name }}.pub
     - user: {{ name }}
     - group: {{ user_group }}
     - mode: 644
@@ -292,6 +322,9 @@ users_ssh_known_hosts_{{ name }}_{{ loop.index0 }}:
     {% if 'enc' in host %}
     - enc: {{ host['enc'] }}
     {% endif -%}
+    {% if 'hash_hostname' in host %}
+    - hash_hostname: {{ host['hash_hostname'] }}
+    {% endif -%}
 {% endfor %}
 {% endif %}
 
@@ -313,6 +346,7 @@ users_sudoer-{{ name }}:
     - group: {{ users.root_group }}
     - mode: '0440'
 {% if 'sudo_rules' in user or 'sudo_defaults' in user %}
+#{#%
 {% if 'sudo_rules' in user %}
 {% for rule in user['sudo_rules'] %}
 "validate {{ name }} sudo rule {{ loop.index0 }} {{ name }} {{ rule }}":
@@ -341,6 +375,7 @@ users_sudoer-{{ name }}:
       - file: users_{{ users.sudoers_dir }}/{{ name }}
 {% endfor %}
 {% endif %}
+#%#}
 
 users_{{ users.sudoers_dir }}/{{ name }}:
   file.managed:
@@ -352,6 +387,11 @@ users_{{ users.sudoers_dir }}/{{ name }}:
       {%- endfor %}
       {%- endif %}
       {%- if 'sudo_rules' in user %}
+        ########################################################################
+        # File managed by Salt (users-formula).
+        # Your changes will be overwritten.
+        ########################################################################
+        #
       {%- for rule in user['sudo_rules'] %}
         {{ name }} {{ rule }}
       {%- endfor %}
@@ -359,6 +399,10 @@ users_{{ users.sudoers_dir }}/{{ name }}:
     - require:
       - file: users_sudoer-defaults
       - file: users_sudoer-{{ name }}
+  cmd.wait:
+    - name: visudo -cf {{ users.sudoers_dir }}/{{ name }} || ( rm -rvf {{ users.sudoers_dir }}/{{ name }}; exit 1 )
+    - watch:
+      - file: {{ users.sudoers_dir }}/{{ name }}
 {% endif %}
 {% else %}
 users_{{ users.sudoers_dir }}/{{ name }}:
@@ -380,6 +424,31 @@ users_googleauth-{{ svc }}-{{ name }}:
       - pkg: users_googleauth-package
 {%- endfor %}
 {%- endif %}
+
+{% if 'gitconfig' in user %}
+{% if not salt['cmd.has_exec']('git') %}
+skip_{{ name }}_gitconfig_since_git_not_installed:
+  test.fail_without_changes:
+    - name: "Git configuration for user {{ name }} has been skipped because Git is not installed."
+{% else %}
+{% for key, value in user['gitconfig'].items() %}
+users_{{ name }}_user_gitconfig_{{ loop.index0 }}:
+  {% if grains['saltversioninfo'] >= (2015, 8, 0, 0) %}
+  git.config_set:
+  {% else %}
+  git.config:
+  {% endif %}
+    - name: {{ key }}
+    - value: "{{ value }}"
+    - user: {{ name }}
+    {% if grains['saltversioninfo'] >= (2015, 8, 0, 0) %}
+    - global: True
+    {% else %}
+    - is_global: True
+    {% endif %}
+{% endfor %}
+{% endif %}
+{% endif %}
 
 {% endfor %}
 
