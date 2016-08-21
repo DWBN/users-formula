@@ -104,7 +104,7 @@ set foldnestmax=2
 set foldtext=strpart(getline(v:foldstart),0,50).'\ ...\ '.substitute(getline(v:foldend),'^[\ #]*','','g').'\ '
 endif
 
-set guifont=Menlo:h12
+
 
 " change default mapleader from \ to ,
 let mapleader = ","
