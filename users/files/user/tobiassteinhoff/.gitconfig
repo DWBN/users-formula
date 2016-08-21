@@ -1,0 +1,9 @@
+
+[alias]
+  gca = commit -a
+  
+[push]
+	default = current
+[user]
+	name = Tobias Steinhoff
+	email = tobias@stonehope.de
